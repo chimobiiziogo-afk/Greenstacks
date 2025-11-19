@@ -32,6 +32,13 @@
 (define-constant ERR-INVALID-METHODOLOGY (err u418))
 (define-constant ERR-INVALID-LOCATION (err u419))
 (define-constant ERR-INVALID-NAME (err u420))
+(define-constant ERR-RATE-LIMIT-EXCEEDED (err u421))
+(define-constant ERR-DUPLICATE-PROJECT-NAME (err u422))
+(define-constant ERR-INVALID-TIMESTAMP (err u423))
+(define-constant ERR-PROJECT-INACTIVE (err u424))
+(define-constant ERR-BATCH-TOO-LARGE (err u425))
+(define-constant ERR-EMERGENCY-ONLY (err u426))
+(define-constant ERR-COOLDOWN-ACTIVE (err u427))
 
 (define-constant TREASURY-FEE u250) ;; 2.5% fee (250 basis points)
 (define-constant BASIS-POINTS u10000)
@@ -41,6 +48,11 @@
 (define-constant MAX-STRING-LENGTH u64)
 (define-constant MAX-REASON-LENGTH u128)
 (define-constant MAX-METADATA-LENGTH u256)
+(define-constant RATE-LIMIT-BLOCKS u10) ;; Minimum blocks between operations
+(define-constant MAX-OPERATIONS-PER-BLOCK u5)
+(define-constant MAX-BATCH-SIZE u10)
+(define-constant EMERGENCY-COOLDOWN-BLOCKS u144) ;; ~24 hours at 10min blocks
+(define-constant MIN-AUDIT-INTERVAL u1008) ;; ~1 week
 
 ;; data vars
 (define-data-var next-project-id uint u1)
@@ -50,6 +62,10 @@
 (define-data-var contract-paused bool false)
 (define-data-var max-mint-per-transaction uint u1000000)
 (define-data-var max-listing-amount uint u10000000)
+(define-data-var emergency-mode bool false)
+(define-data-var last-emergency-action uint u0)
+(define-data-var total-projects-created uint u0)
+(define-data-var total-tokens-minted uint u0)
 
 ;; data maps
 (define-map carbon-projects
@@ -107,6 +123,12 @@
 (define-map user-balances-by-project { user: principal, project-id: uint } uint)
 (define-map audit-hashes (buff 32) bool) ;; Prevent duplicate audits
 (define-map nonce-map principal uint) ;; Anti-replay protection
+(define-map project-names (string-ascii 64) bool) ;; Track unique project names
+(define-map last-operation-block principal uint) ;; Rate limiting
+(define-map operations-per-block { user: principal, block: uint } uint)
+(define-map project-status uint bool) ;; true = active, false = inactive
+(define-map last-audit-block uint uint) ;; Track last audit per project
+(define-map verifier-audit-count principal uint) ;; Track audits per verifier ;; Operations counter
 
 ;; Security helper functions
 (define-private (check-not-paused)
@@ -221,6 +243,60 @@
   )
 )
 
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block stacks-block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block { user: user, block: current-block })))
+  )
+    ;; Check if enough blocks have passed OR if under per-block limit
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) RATE-LIMIT-BLOCKS)
+        (< ops-count MAX-OPERATIONS-PER-BLOCK)
+      )
+      ERR-RATE-LIMIT-EXCEEDED
+    )
+    ;; Update counters
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block { user: user, block: current-block } (+ ops-count u1))
+    (ok true)
+  )
+)
+
+(define-private (check-unique-project-name (name (string-ascii 64)))
+  (if (default-to false (map-get? project-names name))
+    (err ERR-DUPLICATE-PROJECT-NAME)
+    (ok true)
+  )
+)
+
+(define-private (check-emergency-cooldown)
+  (let ((last-emergency (var-get last-emergency-action)))
+    (if (is-eq last-emergency u0)
+      (ok true)
+      (if (>= (- stacks-block-height last-emergency) EMERGENCY-COOLDOWN-BLOCKS)
+        (ok true)
+        (err ERR-COOLDOWN-ACTIVE)
+      )
+    )
+  )
+)
+
+(define-private (check-project-active (project-id uint))
+  (if (default-to true (map-get? project-status project-id))
+    (ok true)
+    (err ERR-PROJECT-INACTIVE)
+  )
+)
+
+(define-private (validate-batch-size (size uint))
+  (if (and (> size u0) (<= size MAX-BATCH-SIZE))
+    (ok true)
+    (err ERR-BATCH-TOO-LARGE)
+  )
+)
+
 ;; public functions
 
 ;; Initialize authorized verifiers
@@ -244,7 +320,9 @@
   (metadata-uri (string-ascii 256)))
   (let ((project-id (var-get next-project-id)))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (and (> (len name) u0) (<= (len name) MAX-STRING-LENGTH)) ERR-INVALID-NAME)
+    (asserts! (not (default-to false (map-get? project-names name))) ERR-DUPLICATE-PROJECT-NAME)
     (asserts! (and (> (len location) u0) (<= (len location) MAX-STRING-LENGTH)) ERR-INVALID-LOCATION)
     (asserts! (and (> (len methodology) u0) (<= (len methodology) u32)) ERR-INVALID-METHODOLOGY)
     (asserts! (and (>= vintage-year MIN-VINTAGE-YEAR) (<= vintage-year MAX-VINTAGE-YEAR)) ERR-INVALID-VINTAGE-YEAR)
@@ -253,6 +331,9 @@
     (asserts! (<= total-credits (var-get max-mint-per-transaction)) ERR-INVALID-AMOUNT)
     (asserts! (> (len verifier) u0) ERR-INVALID-INPUT)
     (asserts! (<= (len verifier) u32) ERR-INVALID-INPUT)
+    
+    ;; Register project name
+    (map-set project-names name true)
     
     (map-set carbon-projects project-id {
       name: name,
@@ -268,6 +349,10 @@
     })
     (try! (safe-add project-id u1))
     (var-set next-project-id (unwrap! (safe-add project-id u1) ERR-OVERFLOW))
+    ;; Set project as active by default
+    (map-set project-status project-id true)
+    ;; Track total projects
+    (var-set total-projects-created (unwrap! (safe-add (var-get total-projects-created) u1) ERR-OVERFLOW))
     (ok project-id)
   )
 )
@@ -276,6 +361,7 @@
 (define-public (verify-project (project-id uint))
   (let ((project (unwrap! (map-get? carbon-projects project-id) ERR-PROJECT-NOT-FOUND)))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (default-to false (map-get? authorized-verifiers tx-sender)) ERR-NOT-AUTHORIZED)
     (asserts! (not (get verified project)) ERR-INVALID-INPUT) ;; Prevent re-verification
     (map-set carbon-projects project-id (merge project { verified: true }))
@@ -287,10 +373,12 @@
 (define-public (mint-tokens (project-id uint) (amount uint) (recipient principal))
   (let ((project (unwrap! (map-get? carbon-projects project-id) ERR-PROJECT-NOT-FOUND)))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (is-eq tx-sender (get project-owner project)) ERR-NOT-AUTHORIZED)
     (asserts! (get verified project) ERR-NOT-AUTHORIZED)
     (asserts! (and (> amount u0) (<= amount (var-get max-mint-per-transaction))) ERR-INVALID-AMOUNT)
     (asserts! (not (is-eq recipient tx-sender)) ERR-INVALID-INPUT) ;; Prevent self-minting
+    (asserts! (not (is-eq recipient CONTRACT-OWNER)) ERR-INVALID-INPUT) ;; Prevent minting to contract owner
     
     (let ((current-issued (get issued-credits project))
           (total-credits (get total-credits project))
@@ -308,6 +396,9 @@
           { user: recipient, project-id: project-id }
           new-balance))
       
+      ;; Track total minted
+      (var-set total-tokens-minted (unwrap! (safe-add (var-get total-tokens-minted) amount) ERR-OVERFLOW))
+      
       ;; Mint tokens
       (ft-mint? carbon-token amount recipient)
     )
@@ -319,6 +410,7 @@
   (let ((listing-id (var-get next-listing-id))
         (user-balance (default-to u0 (map-get? user-balances-by-project { user: tx-sender, project-id: project-id }))))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (and (> amount u0) (<= amount (var-get max-listing-amount))) ERR-INVALID-AMOUNT)
     (asserts! (and (> price-per-token u0) (<= price-per-token MAX-PRICE)) ERR-PRICE-TOO-HIGH)
     (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
@@ -329,7 +421,7 @@
       amount: amount,
       price-per-token: price-per-token,
       project-id: project-id,
-      created-at: u0,
+      created-at: stacks-block-height,
       active: true
     })
     (var-set next-listing-id (unwrap! (safe-add listing-id u1) ERR-OVERFLOW))
@@ -341,6 +433,7 @@
 (define-public (buy-listing (listing-id uint) (amount uint))
   (let ((listing (unwrap! (map-get? marketplace-listings listing-id) ERR-LISTING-NOT-FOUND)))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (get active listing) ERR-LISTING-NOT-FOUND)
     (asserts! (not (is-eq tx-sender (get seller listing))) ERR-CANNOT-BUY-OWN-LISTING)
     (asserts! (and (> amount u0) (<= amount (var-get max-mint-per-transaction))) ERR-INVALID-AMOUNT)
@@ -389,6 +482,7 @@
 (define-public (cancel-listing (listing-id uint))
   (let ((listing (unwrap! (map-get? marketplace-listings listing-id) ERR-LISTING-NOT-FOUND)))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (is-eq tx-sender (get seller listing)) ERR-NOT-LISTING-OWNER)
     (asserts! (get active listing) ERR-LISTING-NOT-FOUND)
     
@@ -403,12 +497,13 @@
         (retirement-counter (default-to u0 (map-get? user-retirement-counter tx-sender))))
     
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (and (> amount u0) (<= amount (var-get max-mint-per-transaction))) ERR-INVALID-AMOUNT)
     (asserts! (and (> (len reason) u0) (<= (len reason) MAX-REASON-LENGTH)) ERR-INVALID-REASON)
     (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
     (asserts! (is-some (map-get? carbon-projects project-id)) ERR-PROJECT-NOT-FOUND)
     
-    ;; Update balances
+    ;; Update balances FIRST (reentrancy protection)
     (map-set user-balances-by-project 
       { user: tx-sender, project-id: project-id } 
       (unwrap! (safe-sub user-balance amount) ERR-UNDERFLOW))
@@ -416,13 +511,13 @@
     ;; Burn tokens
     (try! (ft-burn? carbon-token amount tx-sender))
     
-    ;; Record retirement
+    ;; Record retirement with block-height timestamp
     (map-set retirement-records 
       { user: tx-sender, retirement-id: retirement-counter }
       {
         amount: amount,
         project-id: project-id,
-        retired-at: u0,
+        retired-at: stacks-block-height,
         reason: reason,
         proof-hash: proof-hash
       })
@@ -438,6 +533,7 @@
 (define-public (add-project-audit (project-id uint) (audit-hash (buff 32)) (status (string-ascii 16)))
   (let ((audit-counter (default-to u0 (map-get? project-audit-counter project-id))))
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (try! (check-rate-limit tx-sender))
     (asserts! (default-to false (map-get? authorized-verifiers tx-sender)) ERR-NOT-AUTHORIZED)
     (asserts! (is-some (map-get? carbon-projects project-id)) ERR-PROJECT-NOT-FOUND)
     (asserts! (not (default-to false (map-get? audit-hashes audit-hash))) ERR-DUPLICATE-AUDIT)
@@ -447,13 +543,18 @@
       { project-id: project-id, audit-id: audit-counter }
       {
         auditor: tx-sender,
-        audit-date: u0,
+        audit-date: stacks-block-height,
         audit-hash: audit-hash,
         status: status
       })
     
     (map-set audit-hashes audit-hash true)
     (map-set project-audit-counter project-id (unwrap! (safe-add audit-counter u1) ERR-OVERFLOW))
+    ;; Track last audit block and verifier stats
+    (map-set last-audit-block project-id stacks-block-height)
+    (let ((verifier-count (default-to u0 (map-get? verifier-audit-count tx-sender))))
+      (map-set verifier-audit-count tx-sender (unwrap! (safe-add verifier-count u1) ERR-OVERFLOW))
+    )
     (ok audit-counter)
   )
 )
@@ -523,9 +624,12 @@
 (define-public (transfer (amount uint) (from principal) (to principal) (memo (optional (buff 34))))
   (begin
     (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
-    (asserts! (or (is-eq tx-sender from) (is-eq tx-sender CONTRACT-OWNER)) ERR-NOT-AUTHORIZED)
+    (try! (check-rate-limit tx-sender))
+    ;; Only allow users to transfer their own tokens (removed CONTRACT-OWNER override)
+    (asserts! (is-eq tx-sender from) ERR-NOT-AUTHORIZED)
     (asserts! (and (> amount u0) (<= amount (var-get max-mint-per-transaction))) ERR-INVALID-AMOUNT)
     (asserts! (not (is-eq from to)) ERR-INVALID-INPUT)
+    (asserts! (not (is-eq to CONTRACT-OWNER)) ERR-INVALID-INPUT) ;; Prevent transfers to contract owner
     (ft-transfer? carbon-token amount from to)
   )
 )
@@ -569,4 +673,173 @@
 
 (define-read-only (get-treasury-address)
   (var-get treasury-address)
+)
+
+(define-read-only (get-user-nonce (user principal))
+  (default-to u0 (map-get? nonce-map user))
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (is-project-name-taken (name (string-ascii 64)))
+  (default-to false (map-get? project-names name))
+)
+
+(define-read-only (get-audit-info (project-id uint) (audit-id uint))
+  (map-get? project-audits { project-id: project-id, audit-id: audit-id })
+)
+
+(define-read-only (get-project-status (project-id uint))
+  (default-to true (map-get? project-status project-id))
+)
+
+(define-read-only (get-total-projects-created)
+  (var-get total-projects-created)
+)
+
+(define-read-only (get-total-tokens-minted)
+  (var-get total-tokens-minted)
+)
+
+(define-read-only (is-emergency-mode)
+  (var-get emergency-mode)
+)
+
+(define-read-only (get-last-emergency-action)
+  (var-get last-emergency-action)
+)
+
+(define-read-only (get-verifier-audit-count (verifier principal))
+  (default-to u0 (map-get? verifier-audit-count verifier))
+)
+
+(define-read-only (get-last-audit-block (project-id uint))
+  (default-to u0 (map-get? last-audit-block project-id))
+)
+
+;; Get token name and symbol for SIP-010 compatibility
+(define-read-only (get-name)
+  (ok "GreenStacks Carbon Token")
+)
+
+(define-read-only (get-symbol)
+  (ok "CARBON")
+)
+
+(define-read-only (get-decimals)
+  (ok u6)
+)
+
+(define-read-only (get-balance (account principal))
+  (ok (ft-get-balance carbon-token account))
+)
+
+(define-read-only (get-total-supply)
+  (ok (ft-get-supply carbon-token))
+)
+
+(define-read-only (get-token-uri)
+  (ok (some "https://greenstacks.io/token-metadata.json"))
+)
+
+;; Emergency functions
+(define-public (activate-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (unwrap! (check-emergency-cooldown) ERR-COOLDOWN-ACTIVE)
+    (var-set emergency-mode true)
+    (var-set last-emergency-action stacks-block-height)
+    (ok true)
+  )
+)
+
+(define-public (deactivate-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (var-get emergency-mode) ERR-EMERGENCY-ONLY)
+    (var-set emergency-mode false)
+    (ok true)
+  )
+)
+
+(define-public (deactivate-project (project-id uint))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? carbon-projects project-id)) ERR-PROJECT-NOT-FOUND)
+    (map-set project-status project-id false)
+    (ok true)
+  )
+)
+
+(define-public (reactivate-project (project-id uint))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? carbon-projects project-id)) ERR-PROJECT-NOT-FOUND)
+    (map-set project-status project-id true)
+    (ok true)
+  )
+)
+
+;; Batch retire tokens for multiple users (gas optimization)
+(define-public (batch-retire-tokens 
+  (retirements (list 10 { amount: uint, project-id: uint, reason: (string-ascii 128), proof-hash: (buff 32) })))
+  (let ((rate-check (check-rate-limit tx-sender))
+        (size-check (validate-batch-size (len retirements))))
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (not (var-get emergency-mode)) ERR-EMERGENCY-ONLY)
+    (unwrap! rate-check ERR-RATE-LIMIT-EXCEEDED)
+    (unwrap! size-check ERR-BATCH-TOO-LARGE)
+    (ok (fold process-retirement-fold retirements (list)))
+  )
+)
+
+(define-private (process-retirement-fold 
+  (retirement { amount: uint, project-id: uint, reason: (string-ascii 128), proof-hash: (buff 32) })
+  (acc (list 10 uint)))
+  (let (
+    (amount (get amount retirement))
+    (project-id (get project-id retirement))
+    (reason (get reason retirement))
+    (proof-hash (get proof-hash retirement))
+    (user-balance (default-to u0 (map-get? user-balances-by-project { user: tx-sender, project-id: project-id })))
+    (retirement-counter (default-to u0 (map-get? user-retirement-counter tx-sender)))
+  )
+    ;; Only process if validations pass
+    (if (and 
+          (and (> amount u0) (<= amount (var-get max-mint-per-transaction)))
+          (and (> (len reason) u0) (<= (len reason) MAX-REASON-LENGTH))
+          (>= user-balance amount)
+          (is-some (map-get? carbon-projects project-id)))
+      (begin
+        ;; Update balances
+        (map-set user-balances-by-project 
+          { user: tx-sender, project-id: project-id } 
+          (unwrap-panic (safe-sub user-balance amount)))
+        
+        ;; Burn tokens
+        (unwrap-panic (ft-burn? carbon-token amount tx-sender))
+        
+        ;; Record retirement
+        (map-set retirement-records 
+          { user: tx-sender, retirement-id: retirement-counter }
+          {
+            amount: amount,
+            project-id: project-id,
+            retired-at: stacks-block-height,
+            reason: reason,
+            proof-hash: proof-hash
+          })
+        
+        (map-set user-retirement-counter tx-sender (unwrap-panic (safe-add retirement-counter u1)))
+        (var-set total-retired (unwrap-panic (safe-add (var-get total-retired) amount)))
+        
+        (unwrap-panic (as-max-len? (append acc retirement-counter) u10))
+      )
+      acc
+    )
+  )
 )
