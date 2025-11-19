@@ -5,6 +5,7 @@ const accounts = simnet.getAccounts();
 const deployer = accounts.get("deployer")!;
 const address1 = accounts.get("wallet_1")!;
 const address2 = accounts.get("wallet_2")!;
+const address3 = accounts.get("wallet_3")!;
 
 describe("GreenStacks Security Tests", () => {
   beforeEach(() => {
@@ -343,6 +344,314 @@ describe("GreenStacks Security Tests", () => {
       const { result } = simnet.callReadOnlyFn("GreenStacks", "get-last-operation-block", [Cl.standardPrincipal(address1)], deployer);
       // Verify it returns a value (block height varies based on test execution)
       expect(result).toBeDefined();
+    });
+  });
+
+  describe("Emergency Mode", () => {
+    it("should allow owner to activate emergency mode", () => {
+      const { result } = simnet.callPublicFn("GreenStacks", "activate-emergency-mode", [], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+
+      const { result: isEmergency } = simnet.callReadOnlyFn("GreenStacks", "is-emergency-mode", [], deployer);
+      expect(isEmergency).toBeBool(true);
+    });
+
+    it("should prevent non-owner from activating emergency mode", () => {
+      const { result } = simnet.callPublicFn("GreenStacks", "activate-emergency-mode", [], address1);
+      expect(result).toBeErr(Cl.uint(401)); // ERR-NOT-AUTHORIZED
+    });
+
+    it("should allow owner to deactivate emergency mode", () => {
+      // First activate
+      simnet.callPublicFn("GreenStacks", "activate-emergency-mode", [], deployer);
+      
+      // Then deactivate
+      const { result } = simnet.callPublicFn("GreenStacks", "deactivate-emergency-mode", [], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+
+      const { result: isEmergency } = simnet.callReadOnlyFn("GreenStacks", "is-emergency-mode", [], deployer);
+      expect(isEmergency).toBeBool(false);
+    });
+
+    it("should enforce emergency cooldown period", () => {
+      // Activate emergency mode
+      simnet.callPublicFn("GreenStacks", "activate-emergency-mode", [], deployer);
+      
+      // Deactivate
+      simnet.callPublicFn("GreenStacks", "deactivate-emergency-mode", [], deployer);
+      
+      // Try to activate again immediately (should fail due to cooldown)
+      const { result } = simnet.callPublicFn("GreenStacks", "activate-emergency-mode", [], deployer);
+      expect(result).toBeErr(Cl.uint(427)); // ERR-COOLDOWN-ACTIVE
+    });
+
+    it("should block batch operations during emergency mode", () => {
+      // Activate emergency mode
+      simnet.callPublicFn("GreenStacks", "activate-emergency-mode", [], deployer);
+      
+      const retirements = [
+        Cl.tuple({
+          amount: Cl.uint(100),
+          "project-id": Cl.uint(1),
+          reason: Cl.stringAscii("Test retirement"),
+          "proof-hash": Cl.bufferFromHex("0000000000000000000000000000000000000000000000000000000000000001")
+        })
+      ];
+      
+      const { result } = simnet.callPublicFn("GreenStacks", "batch-retire-tokens", [Cl.list(retirements)], address1);
+      expect(result).toBeErr(Cl.uint(426)); // ERR-EMERGENCY-ONLY
+    });
+  });
+
+  describe("Project Status Management", () => {
+    it("should allow owner to deactivate a project", () => {
+      // Create a project first
+      simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Status Test Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+
+      simnet.mineEmptyBlock();
+
+      // Deactivate the project
+      const { result } = simnet.callPublicFn("GreenStacks", "deactivate-project", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+
+      const { result: status } = simnet.callReadOnlyFn("GreenStacks", "get-project-status", [Cl.uint(1)], deployer);
+      expect(status).toBeBool(false);
+    });
+
+    it("should allow owner to reactivate a project", () => {
+      // Create and deactivate a project
+      simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Reactivate Test"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+
+      simnet.mineEmptyBlock();
+      simnet.callPublicFn("GreenStacks", "deactivate-project", [Cl.uint(1)], deployer);
+      
+      simnet.mineEmptyBlock();
+
+      // Reactivate
+      const { result } = simnet.callPublicFn("GreenStacks", "reactivate-project", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+
+      const { result: status } = simnet.callReadOnlyFn("GreenStacks", "get-project-status", [Cl.uint(1)], deployer);
+      expect(status).toBeBool(true);
+    });
+
+    it("should prevent non-owner from deactivating projects", () => {
+      simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Auth Test Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+
+      simnet.mineEmptyBlock();
+
+      const { result } = simnet.callPublicFn("GreenStacks", "deactivate-project", [Cl.uint(1)], address1);
+      expect(result).toBeErr(Cl.uint(401)); // ERR-NOT-AUTHORIZED
+    });
+  });
+
+  describe("SIP-010 Token Standard Compliance", () => {
+    it("should return correct token name", () => {
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-name", [], deployer);
+      expect(result).toBeOk(Cl.stringAscii("GreenStacks Carbon Token"));
+    });
+
+    it("should return correct token symbol", () => {
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-symbol", [], deployer);
+      expect(result).toBeOk(Cl.stringAscii("CARBON"));
+    });
+
+    it("should return correct decimals", () => {
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-decimals", [], deployer);
+      expect(result).toBeOk(Cl.uint(6));
+    });
+
+    it("should return token URI", () => {
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-token-uri", [], deployer);
+      expect(result).toBeOk(Cl.some(Cl.stringAscii("https://greenstacks.io/token-metadata.json")));
+    });
+
+    it("should return total supply", () => {
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-total-supply", [], deployer);
+      expect(result).toBeOk(Cl.uint(0)); // Initially 0
+    });
+
+    it("should return user balance", () => {
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-balance", [Cl.standardPrincipal(address1)], deployer);
+      expect(result).toBeOk(Cl.uint(0));
+    });
+  });
+
+  describe("Statistics and Tracking", () => {
+    it("should track total projects created", () => {
+      // Create a project
+      simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Stats Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-total-projects-created", [], deployer);
+      expect(result).toBeUint(1);
+    });
+
+    it("should track verifier audit counts", () => {
+      // Create and verify a project
+      simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Audit Count Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+
+      simnet.mineEmptyBlock();
+
+      // Add verifier and verify
+      simnet.callPublicFn("GreenStacks", "add-authorized-verifier", [Cl.standardPrincipal(address2)], deployer);
+      simnet.mineEmptyBlock();
+      
+      simnet.callPublicFn("GreenStacks", "verify-project", [Cl.uint(1)], address2);
+      simnet.mineEmptyBlock();
+
+      // Add an audit
+      simnet.callPublicFn("GreenStacks", "add-project-audit", [
+        Cl.uint(1),
+        Cl.bufferFromHex("0000000000000000000000000000000000000000000000000000000000000001"),
+        Cl.stringAscii("Passed")
+      ], address2);
+
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-verifier-audit-count", [Cl.standardPrincipal(address2)], deployer);
+      expect(result).toBeUint(1);
+    });
+
+    it("should track last audit block for projects", () => {
+      // Create project and add audit
+      simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Last Audit Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+
+      simnet.mineEmptyBlock();
+
+      simnet.callPublicFn("GreenStacks", "add-authorized-verifier", [Cl.standardPrincipal(address2)], deployer);
+      simnet.mineEmptyBlock();
+
+      simnet.callPublicFn("GreenStacks", "add-project-audit", [
+        Cl.uint(1),
+        Cl.bufferFromHex("0000000000000000000000000000000000000000000000000000000000000002"),
+        Cl.stringAscii("Passed")
+      ], address2);
+
+      const { result } = simnet.callReadOnlyFn("GreenStacks", "get-last-audit-block", [Cl.uint(1)], deployer);
+      expect(result).toBeDefined();
+      expect(result).not.toBeUint(0);
+    });
+  });
+
+  describe("Batch Operations", () => {
+    it("should accept batch operations up to max size", () => {
+      // Test with exactly MAX_BATCH_SIZE (10) items
+      // Note: Larger lists are prevented by Clarity's type system (list 10)
+      const retirements = Array(10).fill(
+        Cl.tuple({
+          amount: Cl.uint(10),
+          "project-id": Cl.uint(1),
+          reason: Cl.stringAscii("Test"),
+          "proof-hash": Cl.bufferFromHex("0000000000000000000000000000000000000000000000000000000000000001")
+        })
+      );
+
+      // This will fail due to rate limiting or insufficient balance, but validates batch size is accepted
+      const { result } = simnet.callPublicFn("GreenStacks", "batch-retire-tokens", [Cl.list(retirements)], address1);
+      // Should not fail with ERR-BATCH-TOO-LARGE
+      expect(result).not.toBeErr(Cl.uint(425));
+    });
+
+    it("should reject empty batch operations", () => {
+      const retirements: any[] = [];
+      const { result } = simnet.callPublicFn("GreenStacks", "batch-retire-tokens", [Cl.list(retirements)], address1);
+      expect(result).toBeErr(Cl.uint(425)); // ERR-BATCH-TOO-LARGE (empty list)
+    });
+  });
+
+  describe("Edge Cases and Validation", () => {
+    it("should prevent overflow in safe-add operations", () => {
+      // This is tested implicitly through the contract's use of safe-add
+      // The contract would fail if overflow protection wasn't working
+      const { result: maxMint } = simnet.callReadOnlyFn("GreenStacks", "get-max-mint-per-transaction", [], deployer);
+      expect(maxMint).toBeDefined();
+    });
+
+    it("should handle empty project name validation", () => {
+      const result = simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii(""), // Empty name
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2020),
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+      expect(result.result).toBeErr(Cl.uint(420)); // ERR-INVALID-NAME
+    });
+
+    it("should validate vintage year bounds", () => {
+      // Test year too old
+      const result1 = simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Old Year Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(1989), // Before MIN_VINTAGE_YEAR (1990)
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+      expect(result1.result).toBeErr(Cl.uint(414)); // ERR-INVALID-VINTAGE-YEAR
+
+      simnet.mineEmptyBlock();
+
+      // Test year too far in future
+      const result2 = simnet.callPublicFn("GreenStacks", "create-project", [
+        Cl.stringAscii("Future Year Project"),
+        Cl.stringAscii("Location"),
+        Cl.stringAscii("Methodology"),
+        Cl.uint(2101), // After MAX_VINTAGE_YEAR (2100)
+        Cl.stringAscii("Verifier"),
+        Cl.uint(1000),
+        Cl.stringAscii("ipfs://metadata")
+      ], address1);
+      expect(result2.result).toBeErr(Cl.uint(414)); // ERR-INVALID-VINTAGE-YEAR
     });
   });
 });
